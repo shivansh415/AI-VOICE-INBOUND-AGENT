@@ -1,0 +1,9 @@
+{
+    "reportMissingImports": false,
+    "reportMissingModuleSource": false,
+    "reportOptionalMemberAccess": false,
+    "reportGeneralTypeIssues": false,
+    "reportAttributeAccessIssue": false,
+    "pythonVersion": "3.14",
+    "typeCheckingMode": "off"
+}
