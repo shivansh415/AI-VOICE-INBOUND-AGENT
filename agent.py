@@ -368,15 +368,25 @@ class AgentTools(llm.ToolContext):
         try:
             from db import update_enquiry_booking
             import asyncio as _aio
-            phone = self.booking_intent.get("caller_phone", "")
-            btime = self.booking_intent.get("start_time", "")
+            phone   = self.booking_intent.get("caller_phone", "")
+            btime   = self.booking_intent.get("start_time", "")
             call_id = getattr(self, 'call_id', '') or ''
+            # Pull all lead details collected during the call — these ensure the
+            # fuzzy-match in update_enquiry_booking has the best chance of finding
+            # the right row, and the fallback INSERT is never an "Unknown" ghost row.
+            ld = self.lead_details or {}
             if phone and btime:
                 _aio.get_event_loop().run_in_executor(
                     None, lambda: update_enquiry_booking(
                         caller_phone=phone,
                         booking_datetime=btime,
                         call_id=call_id,
+                        caller_name=ld.get("caller_name") or self.booking_intent.get("caller_name", ""),
+                        property_type=ld.get("property_type", ""),
+                        location=ld.get("location", ""),
+                        budget=ld.get("budget", ""),
+                        purpose=ld.get("purpose", ""),
+                        requirements=ld.get("requirements", ""),
                     )
                 )
         except Exception as _e:
@@ -390,6 +400,7 @@ class AgentTools(llm.ToolContext):
             f"STEP B: Ask: 'Kya aapka koi aur sawal hai?'\n"
             f"STEP C: Wait for the caller to respond. If they say no/nahi/theek hai/okay — call end_call. If they have a question, answer it first, then call end_call."
         )
+
 
     # ── Tool: Save Lead Details (Enquiry) ─────────────────────────────
     @llm.function_tool(description="Save the caller's property enquiry details. Call this ONCE during the conversation after you have understood their requirements (property type, location, budget). Do NOT wait until the end — call this as soon as you have the key details.")

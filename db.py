@@ -365,35 +365,118 @@ def update_enquiry_booking(
     caller_phone:    str,
     booking_datetime: str,
     call_id:         str = "",
+    caller_name:     str = "",
+    property_type:   str = "",
+    location:        str = "",
+    budget:          str = "",
+    purpose:         str = "",
+    requirements:    str = "",
 ) -> dict:
     """Mark an existing enquiry as booking_confirmed=True and set the booking datetime."""
     supabase = get_supabase()
     if not supabase:
         return {"success": False, "message": "Supabase not configured"}
+
+    def _norm_digits(phone: str) -> str:
+        """Return only the significant local digits of a phone number."""
+        digits = "".join(c for c in phone if c.isdigit())
+        if len(digits) == 12 and digits.startswith("91"):
+            digits = digits[2:]
+        elif len(digits) == 11 and digits.startswith("0"):
+            digits = digits[1:]
+        return digits
+
+    booking_update = {
+        "booking_confirmed": True,
+        "booking_datetime":  booking_datetime,
+    }
+
     for attempt in range(_MAX_RETRIES):
         try:
-            query = supabase.table("enquiries").update({
-                "booking_confirmed": True,
-                "booking_datetime": booking_datetime,
-            }).eq("caller_phone", caller_phone)
+            matched_id = None
+
+            # ── Pass 1: match by call_id ───────────────────────────────────
             if call_id:
-                query = query.eq("call_id", call_id)
-            res = query.execute()
-            if res.data:
-                logger.info(f"[ENQUIRY] Booking confirmed for {caller_phone} at {booking_datetime}")
-                return {"success": True, "data": res.data}
-            # No existing enquiry found — INSERT a new one so the record is never lost
-            logger.warning(f"[ENQUIRY] No existing enquiry for {caller_phone} — inserting new record")
-            ins_res = supabase.table("enquiries").insert({
-                "caller_phone":     caller_phone,
-                "caller_name":      "",
-                "call_id":          call_id or "",
+                res = (
+                    supabase.table("enquiries")
+                    .select("id, caller_phone, caller_name")
+                    .eq("call_id", call_id)
+                    .limit(1)
+                    .execute()
+                )
+                if res.data:
+                    matched_id = res.data[0]["id"]
+                    logger.info(f"[ENQUIRY] Matched enquiry by call_id={call_id}")
+
+            # ── Pass 2: fuzzy phone match ──────────────────────────────────
+            if not matched_id and caller_phone:
+                norm_incoming = _norm_digits(caller_phone)
+                candidate_res = (
+                    supabase.table("enquiries")
+                    .select("id, caller_phone, caller_name")
+                    .order("created_at", desc=True)
+                    .limit(20)
+                    .execute()
+                )
+                for row in (candidate_res.data or []):
+                    norm_row = _norm_digits(row.get("caller_phone", ""))
+                    # Exact match after normalisation
+                    if norm_incoming and norm_row == norm_incoming:
+                        matched_id = row["id"]
+                        logger.info(
+                            f"[ENQUIRY] Matched enquiry by normalised phone "
+                            f"'{caller_phone}' → '{norm_incoming}' (row phone='{row['caller_phone']}')"
+                        )
+                        break
+                    # Off-by-one digit (STT dropped/added a digit) — accept only
+                    # when difference is exactly 1 char and last 6 digits match
+                    if norm_incoming and norm_row:
+                        longer  = max(norm_incoming, norm_row, key=len)
+                        shorter = min(norm_incoming, norm_row, key=len)
+                        if len(longer) >= 9 and len(longer) - len(shorter) == 1 and longer.endswith(shorter[-6:]):
+                            matched_id = row["id"]
+                            logger.info(
+                                f"[ENQUIRY] Fuzzy-matched enquiry (off-by-1 digit) "
+                                f"'{norm_incoming}' ≈ '{norm_row}' (row id={row['id']})"
+                            )
+                            break
+
+            # ── Update the matched row ─────────────────────────────────────
+            if matched_id:
+                upd_res = (
+                    supabase.table("enquiries")
+                    .update(booking_update)
+                    .eq("id", matched_id)
+                    .execute()
+                )
+                if upd_res.data:
+                    logger.info(
+                        f"[ENQUIRY] Booking confirmed for id={matched_id} "
+                        f"(phone={caller_phone}, datetime={booking_datetime})"
+                    )
+                    return {"success": True, "data": upd_res.data}
+
+            # ── No match — insert fallback row with all available lead details ──
+            logger.warning(
+                f"[ENQUIRY] No existing enquiry matched for phone='{caller_phone}' "
+                f"call_id='{call_id}' — inserting fallback record"
+            )
+            fallback: dict = {
+                "caller_phone":      caller_phone,
+                "caller_name":       caller_name or "",
+                "call_id":           call_id or "",
                 "booking_confirmed": True,
-                "booking_datetime": booking_datetime,
-                "requirements":     "Auto-inserted by confirm_booking (save_lead_details not called)",
-            }).execute()
-            logger.info(f"[ENQUIRY] Inserted booking record for {caller_phone}")
+                "booking_datetime":  booking_datetime,
+                "requirements":      requirements or "Auto-inserted by confirm_booking",
+            }
+            if property_type: fallback["property_type"] = property_type
+            if location:       fallback["location"]      = location
+            if budget:         fallback["budget"]         = budget
+            if purpose:        fallback["purpose"]        = purpose
+            ins_res = supabase.table("enquiries").insert(fallback).execute()
+            logger.info(f"[ENQUIRY] Inserted fallback booking record for {caller_phone}")
             return {"success": True, "data": ins_res.data, "inserted": True}
+
         except Exception as e:
             err = str(e)
             if _is_retryable(err) and attempt < _MAX_RETRIES - 1:
