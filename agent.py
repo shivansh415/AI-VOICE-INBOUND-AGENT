@@ -829,6 +829,33 @@ async def entrypoint(ctx: JobContext):
     interrupt_count = 0  # (#30)
     _turn_start: float = 0.0  # for latency measurement
 
+    # ── Thinking-filler state ────────────────────────────────────────────
+    # When the LLM is slow (>2.5 s), speaking a filler keeps the WebRTC
+    # connection alive and stops callers from thinking the call dropped.
+    _filler_task: asyncio.Task | None = None
+    _FILLER_DELAY = 2.5        # seconds before speaking a filler
+    _FILLER_PHRASES = [
+        "Ji ek second...",
+        "Hmm, main dekh rahi hoon...",
+        "Ek moment...",
+        "Ji zaroor, ek second...",
+    ]
+    _filler_index = 0          # rotate through phrases so it feels natural
+
+    async def _thinking_filler():
+        """Speak a soft filler phrase if the LLM takes too long to respond."""
+        nonlocal _filler_index
+        try:
+            await asyncio.sleep(_FILLER_DELAY)
+            phrase = _FILLER_PHRASES[_filler_index % len(_FILLER_PHRASES)]
+            _filler_index += 1
+            logger.info(f"[FILLER] LLM slow — speaking filler: '{phrase}'")
+            await session.say(phrase, allow_interruptions=True)
+        except asyncio.CancelledError:
+            pass   # LLM replied in time — silently cancel
+        except Exception as _fe:
+            logger.debug(f"[FILLER] Could not speak filler: {_fe}")
+
     # ── Build agent ───────────────────────────────────────────────────────
     agent = OutboundAssistant(
         agent_tools=agent_tools,
@@ -981,14 +1008,27 @@ async def entrypoint(ctx: JobContext):
     @session.on("agent_state_changed")
     def _on_agent_state_changed(ev):
         global agent_is_speaking
-        nonlocal interrupt_count
+        nonlocal interrupt_count, _filler_task
         old = getattr(ev, "old_state", "?")
         new = ev.new_state
         logger.info(f"[STATE] {old} → {new}")
         if new == "speaking":
             agent_is_speaking = True
-        elif new in ("listening", "thinking"):
+            # LLM responded — cancel any pending filler
+            if _filler_task and not _filler_task.done():
+                _filler_task.cancel()
+                _filler_task = None
+        elif new == "thinking":
             agent_is_speaking = False
+            # Start filler timer — will speak if LLM takes > 2.5 s
+            if _filler_task is None or _filler_task.done():
+                _filler_task = asyncio.create_task(_thinking_filler())
+        elif new == "listening":
+            agent_is_speaking = False
+            # Cancel filler if we somehow entered listening without speaking
+            if _filler_task and not _filler_task.done():
+                _filler_task.cancel()
+                _filler_task = None
         if old == "speaking" and new == "listening":
             # agent was interrupted
             interrupt_count += 1
