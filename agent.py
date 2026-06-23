@@ -936,36 +936,52 @@ async def entrypoint(ctx: JobContext):
     call_start_time = datetime.now(pytz.utc)
 
     # ── Recording → Supabase Storage ─────────────────────────────────────
+    # Requires 4 S3 env vars. If any are missing we skip recording and log
+    # which variable is absent — the silent KeyError was the original bug
+    # that caused some calls to have no Recording button in the UI.
     egress_id = None
-    try:
-        rec_api = api.LiveKitAPI(
-            url=os.environ["LIVEKIT_URL"],
-            api_key=os.environ["LIVEKIT_API_KEY"],
-            api_secret=os.environ["LIVEKIT_API_SECRET"],
-        )
-        egress_resp = await rec_api.egress.start_room_composite_egress(
-            api.RoomCompositeEgressRequest(
-                room_name=ctx.room.name,
-                audio_only=True,
-                file_outputs=[api.EncodedFileOutput(
-                    file_type=api.EncodedFileType.OGG,
-                    filepath=f"recordings/{ctx.room.name}.ogg",
-                    s3=api.S3Upload(
-                        access_key=os.environ["SUPABASE_S3_ACCESS_KEY"],
-                        secret=os.environ["SUPABASE_S3_SECRET_KEY"],
-                        bucket="call-recordings",
-                        region=os.environ.get("SUPABASE_S3_REGION", "ap-south-1"),
-                        endpoint=os.environ["SUPABASE_S3_ENDPOINT"],
-                        force_path_style=True,
-                    )
-                )]
+    _s3_access  = os.environ.get("SUPABASE_S3_ACCESS_KEY", "")
+    _s3_secret  = os.environ.get("SUPABASE_S3_SECRET_KEY", "")
+    _s3_endpoint = os.environ.get("SUPABASE_S3_ENDPOINT", "")
+    _s3_region  = os.environ.get("SUPABASE_S3_REGION", "ap-south-1")
+    _missing_s3 = [k for k, v in {
+        "SUPABASE_S3_ACCESS_KEY": _s3_access,
+        "SUPABASE_S3_SECRET_KEY": _s3_secret,
+        "SUPABASE_S3_ENDPOINT":   _s3_endpoint,
+    }.items() if not v]
+    if _missing_s3:
+        logger.warning(f"[RECORDING] Skipped — missing env vars: {_missing_s3}")
+    else:
+        try:
+            rec_api = api.LiveKitAPI(
+                url=os.environ["LIVEKIT_URL"],
+                api_key=os.environ["LIVEKIT_API_KEY"],
+                api_secret=os.environ["LIVEKIT_API_SECRET"],
             )
-        )
-        egress_id = egress_resp.egress_id
-        await rec_api.aclose()
-        logger.info(f"[RECORDING] Started egress: {egress_id}")
-    except Exception as e:
-        logger.warning(f"[RECORDING] Failed to start recording: {e}")
+            egress_resp = await rec_api.egress.start_room_composite_egress(
+                api.RoomCompositeEgressRequest(
+                    room_name=ctx.room.name,
+                    audio_only=True,
+                    file_outputs=[api.EncodedFileOutput(
+                        file_type=api.EncodedFileType.OGG,
+                        filepath=f"recordings/{ctx.room.name}.ogg",
+                        s3=api.S3Upload(
+                            access_key=_s3_access,
+                            secret=_s3_secret,
+                            bucket="call-recordings",
+                            region=_s3_region,
+                            endpoint=_s3_endpoint,
+                            force_path_style=True,
+                        )
+                    )]
+                )
+            )
+            egress_id = egress_resp.egress_id
+            await rec_api.aclose()
+            logger.info(f"[RECORDING] Started egress: {egress_id}")
+        except Exception as e:
+            logger.warning(f"[RECORDING] Failed to start recording: {e}")
+
 
 
     # ── Real-time transcript streaming (#33) ─────────────────────────────
