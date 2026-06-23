@@ -712,8 +712,10 @@ async def entrypoint(ctx: JobContext):
                 azure_endpoint=_azure_endpoint,
                 api_key=_azure_key,
                 api_version=_azure_api_version,
-                max_completion_tokens=120,
-                temperature=0,  # deterministic = faster token sampling
+                temperature=0,       # deterministic = faster token sampling
+                # Note: with_azure() has no max_completion_tokens param.
+                # Token cap is enforced on the other branch (openai.LLM + base_url)
+                # which handles the actual active endpoint (services.ai.azure.com).
             )
             logger.info(f"[LLM] Using Azure OpenAI: deployment={_azure_deployment}")
     else:
@@ -857,25 +859,59 @@ async def entrypoint(ctx: JobContext):
         "Ji, thodi si der aur, main aapke liye check kar rahi hoon...",
     ]
     _filler_index = 0          # rotate through phrases so it feels natural
+    _is_filler_speaking: bool = False  # True while session.say() is running a filler
+
+    # ── Silence detection state ───────────────────────────────────────────
+    # When the agent enters listening state (even after a cancelled LLM call)
+    # and hears nothing for _SILENCE_THRESHOLD seconds, it speaks a gentle
+    # check-in to let the caller know the line is still open.
+    _silence_task: asyncio.Task | None = None
+    _SILENCE_THRESHOLD = 10.0  # seconds before speaking a check-in
+    _SILENCE_PROMPTS = [
+        "Ji sir, main sun rahi hoon, aap bol sakte hain.",
+        "Ji, kya aap wahan hain?",
+        "Hello? Ji main yahan hoon, aap baat kar sakte hain.",
+    ]
+    _silence_prompt_index = 0
+
+    async def _silence_check():
+        """Speak a gentle check-in if the caller has been silent for too long."""
+        nonlocal _silence_prompt_index
+        try:
+            await asyncio.sleep(_SILENCE_THRESHOLD)
+            prompt = _SILENCE_PROMPTS[_silence_prompt_index % len(_SILENCE_PROMPTS)]
+            _silence_prompt_index += 1
+            logger.info(f"[SILENCE] No input for {_SILENCE_THRESHOLD:.0f}s — speaking check-in: '{prompt}'")
+            await session.say(prompt, allow_interruptions=True)
+        except asyncio.CancelledError:
+            pass  # user spoke or agent started speaking — silently cancel
+        except Exception as _se:
+            logger.debug(f"[SILENCE] Could not speak check-in: {_se}")
 
     async def _thinking_filler():
         """Speak filler phrases if the LLM takes too long to respond."""
-        nonlocal _filler_index
+        nonlocal _filler_index, _is_filler_speaking
         try:
             # ── Wave 1: spoken after 1.8 s ──
             await asyncio.sleep(_FILLER_DELAY)
             phrase1 = _FILLER_WAVE1[_filler_index % len(_FILLER_WAVE1)]
             _filler_index += 1
             logger.info(f"[FILLER-1] LLM slow — speaking: '{phrase1}'")
+            _is_filler_speaking = True
             await session.say(phrase1, allow_interruptions=True)
+            _is_filler_speaking = False
             # ── Wave 2: spoken after another ~4.2 s (6 s total) if still thinking ──
             await asyncio.sleep(4.2)
             phrase2 = _FILLER_WAVE2[(_filler_index // len(_FILLER_WAVE1)) % len(_FILLER_WAVE2)]
             logger.info(f"[FILLER-2] LLM very slow — speaking: '{phrase2}'")
+            _is_filler_speaking = True
             await session.say(phrase2, allow_interruptions=True)
+            _is_filler_speaking = False
         except asyncio.CancelledError:
+            _is_filler_speaking = False  # ensure flag is cleared on cancel
             pass   # LLM replied in time — silently cancel
         except Exception as _fe:
+            _is_filler_speaking = False
             logger.debug(f"[FILLER] Could not speak filler: {_fe}")
 
     # ── Build agent ───────────────────────────────────────────────────────
@@ -904,9 +940,14 @@ async def entrypoint(ctx: JobContext):
     # ── Upsert active_calls (#38) — fire-and-forget, don't block session ─
     # Run blocking Supabase I/O in a thread executor with timeout so that
     # DNS failures / network errors never stall the async event loop.
+    _active_calls_table_ok = True  # flipped to False after first PGRST205 error
     async def upsert_active_call(status: str):
+        nonlocal _active_calls_table_ok
+        if not _active_calls_table_ok:
+            return  # table doesn't exist — stop spamming
         loop = asyncio.get_event_loop()
         def _upsert():
+            nonlocal _active_calls_table_ok
             try:
                 sb = db.get_supabase()
                 if sb:
@@ -918,7 +959,11 @@ async def entrypoint(ctx: JobContext):
                         "last_updated": datetime.utcnow().isoformat(),
                     }).execute()
             except Exception as e:
-                logger.warning(f"[ACTIVE-CALL] Supabase upsert failed ({status}): {e}")
+                if "PGRST205" in str(e) or "could not find" in str(e).lower():
+                    _active_calls_table_ok = False
+                    logger.debug("[ACTIVE-CALL] active_calls table not found — disabling upserts")
+                else:
+                    logger.warning(f"[ACTIVE-CALL] Supabase upsert failed ({status}): {e}")
         try:
             await asyncio.wait_for(loop.run_in_executor(None, _upsert), timeout=5.0)
         except asyncio.TimeoutError:
@@ -1060,10 +1105,14 @@ async def entrypoint(ctx: JobContext):
     def _on_agent_speech_committed(ev):
         """Log what the agent actually said so we can confirm LLM→TTS is working."""
         try:
-            # conversation_item_added fires for both user and agent messages
             if getattr(ev.item, "role", None) != "assistant":
                 return
             content = getattr(ev.item, "text_content", None) or ""
+            # Skip filler phrases — they are not real agent turns
+            if _is_filler_speaking or content in (
+                *_FILLER_WAVE1, *_FILLER_WAVE2, *_SILENCE_PROMPTS
+            ):
+                return
             elapsed = (time.perf_counter() - _turn_start) * 1000 if _turn_start else 0
             logger.info(f"[AGENT-REPLY] ({elapsed:.0f}ms) '{content[:160]}'")
             if content:
