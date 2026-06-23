@@ -840,79 +840,31 @@ async def entrypoint(ctx: JobContext):
     interrupt_count = 0  # (#30)
     _turn_start: float = 0.0  # for latency measurement
 
-    # ── Thinking-filler state ────────────────────────────────────────────
-    # When the LLM is slow, speak a filler to:
-    #   (a) keep the WebRTC heartbeat alive so the connection never drops
-    #   (b) signal to the caller that they are still connected and being helped
-    # Two waves: 1st at 1.8s, 2nd at 6s (only if still thinking)
-    _filler_task: asyncio.Task | None = None
-    _FILLER_DELAY = 1.8        # seconds before speaking first filler
-    _FILLER_WAVE1 = [
-        "Ji, ek second...",
-        "Hmm, main dekh rahi hoon...",
-        "Ek moment please...",
-        "Ji zaroor, ek second...",
-    ]
-    _FILLER_WAVE2 = [
-        "Ji sir, almost ho gaya, bas ek second aur...",
-        "Haan ji, main verify kar rahi hoon, bas thoda intezaar...",
-        "Ji, thodi si der aur, main aapke liye check kar rahi hoon...",
-    ]
-    _filler_index = 0          # rotate through phrases so it feels natural
-    _is_filler_speaking: bool = False  # True while session.say() is running a filler
-
-    # ── Silence detection state ───────────────────────────────────────────
-    # When the agent enters listening state (even after a cancelled LLM call)
-    # and hears nothing for _SILENCE_THRESHOLD seconds, it speaks a gentle
-    # check-in to let the caller know the line is still open.
+    # ── Silence detection ──────────────────────────────────────────────────
+    # If the agent is in listening state for >10s with no user input
+    # (e.g. after a cancelled LLM call), speak a gentle check-in so
+    # the caller knows the line is still open.
     _silence_task: asyncio.Task | None = None
-    _SILENCE_THRESHOLD = 10.0  # seconds before speaking a check-in
+    _SILENCE_THRESHOLD = 10.0
     _SILENCE_PROMPTS = [
         "Ji sir, main sun rahi hoon, aap bol sakte hain.",
         "Ji, kya aap wahan hain?",
-        "Hello? Ji main yahan hoon, aap baat kar sakte hain.",
+        "Hello? Main yahan hoon, aap baat kar sakte hain.",
     ]
     _silence_prompt_index = 0
 
     async def _silence_check():
-        """Speak a gentle check-in if the caller has been silent for too long."""
         nonlocal _silence_prompt_index
         try:
             await asyncio.sleep(_SILENCE_THRESHOLD)
             prompt = _SILENCE_PROMPTS[_silence_prompt_index % len(_SILENCE_PROMPTS)]
             _silence_prompt_index += 1
-            logger.info(f"[SILENCE] No input for {_SILENCE_THRESHOLD:.0f}s — speaking check-in: '{prompt}'")
+            logger.info(f"[SILENCE] {_SILENCE_THRESHOLD:.0f}s no input — speaking check-in")
             await session.say(prompt, allow_interruptions=True)
         except asyncio.CancelledError:
-            pass  # user spoke or agent started speaking — silently cancel
+            pass
         except Exception as _se:
-            logger.debug(f"[SILENCE] Could not speak check-in: {_se}")
-
-    async def _thinking_filler():
-        """Speak filler phrases if the LLM takes too long to respond."""
-        nonlocal _filler_index, _is_filler_speaking
-        try:
-            # ── Wave 1: spoken after 1.8 s ──
-            await asyncio.sleep(_FILLER_DELAY)
-            phrase1 = _FILLER_WAVE1[_filler_index % len(_FILLER_WAVE1)]
-            _filler_index += 1
-            logger.info(f"[FILLER-1] LLM slow — speaking: '{phrase1}'")
-            _is_filler_speaking = True
-            await session.say(phrase1, allow_interruptions=True)
-            _is_filler_speaking = False
-            # ── Wave 2: spoken after another ~4.2 s (6 s total) if still thinking ──
-            await asyncio.sleep(4.2)
-            phrase2 = _FILLER_WAVE2[(_filler_index // len(_FILLER_WAVE1)) % len(_FILLER_WAVE2)]
-            logger.info(f"[FILLER-2] LLM very slow — speaking: '{phrase2}'")
-            _is_filler_speaking = True
-            await session.say(phrase2, allow_interruptions=True)
-            _is_filler_speaking = False
-        except asyncio.CancelledError:
-            _is_filler_speaking = False  # ensure flag is cleared on cancel
-            pass   # LLM replied in time — silently cancel
-        except Exception as _fe:
-            _is_filler_speaking = False
-            logger.debug(f"[FILLER] Could not speak filler: {_fe}")
+            logger.debug(f"[SILENCE] check-in error: {_se}")
 
     # ── Build agent ───────────────────────────────────────────────────────
     agent = OutboundAssistant(
@@ -1075,29 +1027,25 @@ async def entrypoint(ctx: JobContext):
     @session.on("agent_state_changed")
     def _on_agent_state_changed(ev):
         global agent_is_speaking
-        nonlocal interrupt_count, _filler_task
+        nonlocal interrupt_count, _silence_task
         old = getattr(ev, "old_state", "?")
         new = ev.new_state
         logger.info(f"[STATE] {old} → {new}")
         if new == "speaking":
             agent_is_speaking = True
-            # LLM responded — cancel any pending filler
-            if _filler_task and not _filler_task.done():
-                _filler_task.cancel()
-                _filler_task = None
+            if _silence_task and not _silence_task.done():
+                _silence_task.cancel()
+                _silence_task = None
         elif new == "thinking":
             agent_is_speaking = False
-            # Start filler timer — will speak if LLM takes > 2.5 s
-            if _filler_task is None or _filler_task.done():
-                _filler_task = asyncio.create_task(_thinking_filler())
+            if _silence_task and not _silence_task.done():
+                _silence_task.cancel()
+                _silence_task = None
         elif new == "listening":
             agent_is_speaking = False
-            # Cancel filler if we somehow entered listening without speaking
-            if _filler_task and not _filler_task.done():
-                _filler_task.cancel()
-                _filler_task = None
+            if _silence_task is None or _silence_task.done():
+                _silence_task = asyncio.create_task(_silence_check())
         if old == "speaking" and new == "listening":
-            # agent was interrupted
             interrupt_count += 1
             logger.info(f"[INTERRUPT] Agent interrupted. Total: {interrupt_count}")
 
@@ -1108,11 +1056,6 @@ async def entrypoint(ctx: JobContext):
             if getattr(ev.item, "role", None) != "assistant":
                 return
             content = getattr(ev.item, "text_content", None) or ""
-            # Skip filler phrases — they are not real agent turns
-            if _is_filler_speaking or content in (
-                *_FILLER_WAVE1, *_FILLER_WAVE2, *_SILENCE_PROMPTS
-            ):
-                return
             elapsed = (time.perf_counter() - _turn_start) * 1000 if _turn_start else 0
             logger.info(f"[AGENT-REPLY] ({elapsed:.0f}ms) '{content[:160]}'")
             if content:
