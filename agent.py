@@ -671,6 +671,7 @@ async def entrypoint(ctx: JobContext):
         agent_llm = openai.LLM.with_groq(
             model=llm_model or "llama-3.3-70b-versatile",
             max_completion_tokens=120,
+            temperature=0,   # deterministic = faster token sampling
         )
         logger.info(f"[LLM] Using Groq: {llm_model}")
     elif llm_provider == "claude":
@@ -681,6 +682,7 @@ async def entrypoint(ctx: JobContext):
             base_url="https://api.anthropic.com/v1/",
             api_key=_anthropic_key,
             max_completion_tokens=120,
+            temperature=0,   # deterministic = faster token sampling
         )
         logger.info(f"[LLM] Using Claude via Anthropic: {llm_model}")
     elif llm_provider == "azure":
@@ -698,6 +700,7 @@ async def entrypoint(ctx: JobContext):
                 base_url=_azure_endpoint,
                 api_key=_azure_key,
                 max_completion_tokens=120,  # cap tokens for voice latency
+                temperature=0,              # deterministic = faster token sampling
             )
             logger.info(f"[LLM] Using Azure AI Services (OpenAI-compat): {_azure_endpoint} / {_azure_deployment}")
         else:
@@ -709,10 +712,16 @@ async def entrypoint(ctx: JobContext):
                 azure_endpoint=_azure_endpoint,
                 api_key=_azure_key,
                 api_version=_azure_api_version,
+                max_completion_tokens=120,
+                temperature=0,  # deterministic = faster token sampling
             )
             logger.info(f"[LLM] Using Azure OpenAI: deployment={_azure_deployment}")
     else:
-        agent_llm = openai.LLM(model=llm_model, max_completion_tokens=120)  # cap tokens (#7)
+        agent_llm = openai.LLM(
+            model=llm_model,
+            max_completion_tokens=120,
+            temperature=0,  # deterministic = faster token sampling
+        )  # cap tokens (#7)
         logger.info(f"[LLM] Using OpenAI: {llm_model}")
 
     # ── Build STT (#1 16kHz, #20 auto-detect, #9 Deepgram) ──────────────
@@ -830,27 +839,40 @@ async def entrypoint(ctx: JobContext):
     _turn_start: float = 0.0  # for latency measurement
 
     # ── Thinking-filler state ────────────────────────────────────────────
-    # When the LLM is slow (>2.5 s), speaking a filler keeps the WebRTC
-    # connection alive and stops callers from thinking the call dropped.
+    # When the LLM is slow, speak a filler to:
+    #   (a) keep the WebRTC heartbeat alive so the connection never drops
+    #   (b) signal to the caller that they are still connected and being helped
+    # Two waves: 1st at 1.8s, 2nd at 6s (only if still thinking)
     _filler_task: asyncio.Task | None = None
-    _FILLER_DELAY = 2.5        # seconds before speaking a filler
-    _FILLER_PHRASES = [
-        "Ji ek second...",
+    _FILLER_DELAY = 1.8        # seconds before speaking first filler
+    _FILLER_WAVE1 = [
+        "Ji, ek second...",
         "Hmm, main dekh rahi hoon...",
-        "Ek moment...",
+        "Ek moment please...",
         "Ji zaroor, ek second...",
+    ]
+    _FILLER_WAVE2 = [
+        "Ji sir, almost ho gaya, bas ek second aur...",
+        "Haan ji, main verify kar rahi hoon, bas thoda intezaar...",
+        "Ji, thodi si der aur, main aapke liye check kar rahi hoon...",
     ]
     _filler_index = 0          # rotate through phrases so it feels natural
 
     async def _thinking_filler():
-        """Speak a soft filler phrase if the LLM takes too long to respond."""
+        """Speak filler phrases if the LLM takes too long to respond."""
         nonlocal _filler_index
         try:
+            # ── Wave 1: spoken after 1.8 s ──
             await asyncio.sleep(_FILLER_DELAY)
-            phrase = _FILLER_PHRASES[_filler_index % len(_FILLER_PHRASES)]
+            phrase1 = _FILLER_WAVE1[_filler_index % len(_FILLER_WAVE1)]
             _filler_index += 1
-            logger.info(f"[FILLER] LLM slow — speaking filler: '{phrase}'")
-            await session.say(phrase, allow_interruptions=True)
+            logger.info(f"[FILLER-1] LLM slow — speaking: '{phrase1}'")
+            await session.say(phrase1, allow_interruptions=True)
+            # ── Wave 2: spoken after another ~4.2 s (6 s total) if still thinking ──
+            await asyncio.sleep(4.2)
+            phrase2 = _FILLER_WAVE2[(_filler_index // len(_FILLER_WAVE1)) % len(_FILLER_WAVE2)]
+            logger.info(f"[FILLER-2] LLM very slow — speaking: '{phrase2}'")
+            await session.say(phrase2, allow_interruptions=True)
         except asyncio.CancelledError:
             pass   # LLM replied in time — silently cancel
         except Exception as _fe:
