@@ -1294,21 +1294,31 @@ async def entrypoint(ctx: JobContext):
             logger.error(f"[SHUTDOWN] save_call_log error: {e}")
 
         # ── Auto-save enquiry if save_lead_details was never called ──────────
-        # This happens when the LLM skips the lead-save step and goes straight
-        # to booking. We still want a record in the enquiries table.
-        if not agent_tools.lead_saved and not agent_tools.booking_confirmed:
+        # This happens when the LLM skips save_lead_details and jumps straight
+        # to booking. We MUST still write an enquiry row — the old code excluded
+        # booking_confirmed calls which left confirmed bookings with NO enquiry row.
+        if not agent_tools.lead_saved:
             _auto_name  = agent_tools.caller_name or ""
             _auto_phone = caller_phone
-            _booking_ok = booking_status_msg.startswith("Booking Confirmed")
+            _booking_ok = agent_tools.booking_confirmed
             _booking_dt = ""
-            if agent_tools.booking_intent and _booking_ok:
+            if agent_tools.booking_intent:
                 _booking_dt = agent_tools.booking_intent.get("start_time", "")
+                # Use caller name from booking_intent if not already known
+                if not _auto_name:
+                    _auto_name = agent_tools.booking_intent.get("caller_name", "")
+            # Use any lead_details fields that were partially collected
+            _ld = agent_tools.lead_details or {}
             from db import save_enquiry as _save_enquiry
             def _auto_save_enquiry():
                 _save_enquiry(
                     caller_name=_auto_name or "Unknown",
                     caller_phone=_auto_phone,
-                    requirements="Auto-saved: lead details not collected during call",
+                    property_type=_ld.get("property_type", ""),
+                    location=_ld.get("location", ""),
+                    budget=_ld.get("budget", ""),
+                    purpose=_ld.get("purpose", ""),
+                    requirements=_ld.get("requirements", "Auto-saved: lead details not collected during call"),
                     booking_confirmed=_booking_ok,
                     booking_datetime=_booking_dt,
                 )
@@ -1316,11 +1326,12 @@ async def entrypoint(ctx: JobContext):
                 await asyncio.wait_for(
                     loop.run_in_executor(None, _auto_save_enquiry), timeout=5.0
                 )
-                logger.info("[SHUTDOWN] Auto-saved minimal enquiry (save_lead_details not called)")
+                logger.info("[SHUTDOWN] Auto-saved enquiry (save_lead_details not called)")
             except asyncio.TimeoutError:
                 logger.warning("[SHUTDOWN] Auto-enquiry save timed out")
             except Exception as _ae:
                 logger.warning(f"[SHUTDOWN] Auto-enquiry save failed: {_ae}")
+
 
     # NOTE: Do NOT register ctx.add_shutdown_callback(unified_shutdown_hook).
     # The participant_disconnected event above already triggers unified_shutdown_hook
