@@ -741,7 +741,7 @@ async def entrypoint(ctx: JobContext):
             agent_stt = sarvam.STT(
                 language=stt_language,
                 model="saaras:v3",
-                mode="translate",
+                mode="transcribe",  # single transcript per utterance
                 flush_signal=True,
                 sample_rate=16000,
             )
@@ -749,11 +749,11 @@ async def entrypoint(ctx: JobContext):
         agent_stt = sarvam.STT(
             language=stt_language,      # "unknown" = auto-detect (#20)
             model="saaras:v3",
-            mode="translate",
+            mode="transcribe",          # GPT-4.1-mini handles Hindi natively
             flush_signal=True,
             sample_rate=16000,          # force 16kHz (#1)
         )
-        logger.info("[STT] Using Sarvam Saaras v3")
+        logger.info("[STT] Using Sarvam Saaras v3 (transcribe mode)")
 
     # ── Build TTS (#2 24kHz, #10 ElevenLabs) ────────────────────────────
     if tts_provider == "elevenlabs":
@@ -839,32 +839,6 @@ async def entrypoint(ctx: JobContext):
     turn_count    = 0
     interrupt_count = 0  # (#30)
     _turn_start: float = 0.0  # for latency measurement
-
-    # ── Silence detection ──────────────────────────────────────────────────
-    # If the agent is in listening state for >10s with no user input
-    # (e.g. after a cancelled LLM call), speak a gentle check-in so
-    # the caller knows the line is still open.
-    _silence_task: asyncio.Task | None = None
-    _SILENCE_THRESHOLD = 10.0
-    _SILENCE_PROMPTS = [
-        "Ji sir, main sun rahi hoon, aap bol sakte hain.",
-        "Ji, kya aap wahan hain?",
-        "Hello? Main yahan hoon, aap baat kar sakte hain.",
-    ]
-    _silence_prompt_index = 0
-
-    async def _silence_check():
-        nonlocal _silence_prompt_index
-        try:
-            await asyncio.sleep(_SILENCE_THRESHOLD)
-            prompt = _SILENCE_PROMPTS[_silence_prompt_index % len(_SILENCE_PROMPTS)]
-            _silence_prompt_index += 1
-            logger.info(f"[SILENCE] {_SILENCE_THRESHOLD:.0f}s no input — speaking check-in")
-            await session.say(prompt, allow_interruptions=True)
-        except asyncio.CancelledError:
-            pass
-        except Exception as _se:
-            logger.debug(f"[SILENCE] check-in error: {_se}")
 
     # ── Build agent ───────────────────────────────────────────────────────
     agent = OutboundAssistant(
@@ -1027,24 +1001,14 @@ async def entrypoint(ctx: JobContext):
     @session.on("agent_state_changed")
     def _on_agent_state_changed(ev):
         global agent_is_speaking
-        nonlocal interrupt_count, _silence_task
+        nonlocal interrupt_count
         old = getattr(ev, "old_state", "?")
         new = ev.new_state
         logger.info(f"[STATE] {old} → {new}")
         if new == "speaking":
             agent_is_speaking = True
-            if _silence_task and not _silence_task.done():
-                _silence_task.cancel()
-                _silence_task = None
-        elif new == "thinking":
+        elif new in ("thinking", "listening"):
             agent_is_speaking = False
-            if _silence_task and not _silence_task.done():
-                _silence_task.cancel()
-                _silence_task = None
-        elif new == "listening":
-            agent_is_speaking = False
-            if _silence_task is None or _silence_task.done():
-                _silence_task = asyncio.create_task(_silence_check())
         if old == "speaking" and new == "listening":
             interrupt_count += 1
             logger.info(f"[INTERRUPT] Agent interrupted. Total: {interrupt_count}")
