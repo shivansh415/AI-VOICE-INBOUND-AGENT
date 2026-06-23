@@ -952,12 +952,12 @@ async def entrypoint(ctx: JobContext):
     if _missing_s3:
         logger.warning(f"[RECORDING] Skipped — missing env vars: {_missing_s3}")
     else:
+        rec_api = api.LiveKitAPI(
+            url=os.environ["LIVEKIT_URL"],
+            api_key=os.environ["LIVEKIT_API_KEY"],
+            api_secret=os.environ["LIVEKIT_API_SECRET"],
+        )
         try:
-            rec_api = api.LiveKitAPI(
-                url=os.environ["LIVEKIT_URL"],
-                api_key=os.environ["LIVEKIT_API_KEY"],
-                api_secret=os.environ["LIVEKIT_API_SECRET"],
-            )
             egress_resp = await rec_api.egress.start_room_composite_egress(
                 api.RoomCompositeEgressRequest(
                     room_name=ctx.room.name,
@@ -977,12 +977,11 @@ async def entrypoint(ctx: JobContext):
                 )
             )
             egress_id = egress_resp.egress_id
-            await rec_api.aclose()
             logger.info(f"[RECORDING] Started egress: {egress_id}")
         except Exception as e:
             logger.warning(f"[RECORDING] Failed to start recording: {e}")
-
-
+        finally:
+            await rec_api.aclose()   # always close — avoids unclosed connector errors
 
     # ── Real-time transcript streaming (#33) ─────────────────────────────
     _transcript_table_ok = True  # flipped to False after first insert failure
@@ -1218,17 +1217,16 @@ async def entrypoint(ctx: JobContext):
         # Stop recording — 4s timeout so a LiveKit API hiccup can't block shutdown
         recording_url = ""
         if egress_id:
+            stop_api = api.LiveKitAPI(
+                url=os.environ["LIVEKIT_URL"],
+                api_key=os.environ["LIVEKIT_API_KEY"],
+                api_secret=os.environ["LIVEKIT_API_SECRET"],
+            )
             try:
-                stop_api = api.LiveKitAPI(
-                    url=os.environ["LIVEKIT_URL"],
-                    api_key=os.environ["LIVEKIT_API_KEY"],
-                    api_secret=os.environ["LIVEKIT_API_SECRET"],
-                )
                 await asyncio.wait_for(
                     stop_api.egress.stop_egress(api.StopEgressRequest(egress_id=egress_id)),
                     timeout=4.0,
                 )
-                await stop_api.aclose()
                 recording_url = (
                     f"{os.environ.get('SUPABASE_URL','')}/storage/v1/object/public/"
                     f"call-recordings/recordings/{ctx.room.name}.ogg"
@@ -1238,6 +1236,9 @@ async def entrypoint(ctx: JobContext):
                 logger.warning("[RECORDING] Stop egress timed out (4s)")
             except Exception as e:
                 logger.warning(f"[RECORDING] Stop failed: {e}")
+            finally:
+                await stop_api.aclose()  # always close — avoids unclosed connector errors
+
 
         # Update active_calls to completed (#38) — fire-and-forget
         asyncio.create_task(upsert_active_call("completed"))
